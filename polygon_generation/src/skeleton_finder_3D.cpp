@@ -1,5 +1,7 @@
 #include "polygon_generation/skeleton_finder_3D.h"
 #include <algorithm>
+#include <geometry_msgs/PointStamped.h>
+#include <visualization_msgs/MarkerArray.h>
 
 using namespace Eigen;
 using namespace std;
@@ -2450,4 +2452,222 @@ void SkeletonFinder::visStart() {
   marker.points.push_back(p);
 
   vis_start_pub.publish(marker);
+}
+
+/* -------------------------------------------------------------------------- */
+/* ------------- 单节点可视化测试代码 (请将此部分粘贴到文件末尾) ------------- */
+/* -------------------------------------------------------------------------- */
+
+// 需要额外包含的头文件
+
+// 前向声明，因为 SkeletonFinder 类已经在本文件中定义
+class SkeletonFinder;
+
+class SingleNodeTester
+{
+public:
+    // 构造函数
+    SingleNodeTester(ros::NodeHandle& nh) : nh_(nh)
+    {
+        // 1. 初始化 SkeletonFinder 实例并加载参数
+        sf_test_.reset(new SkeletonFinder());
+        sf_test_->init(nh_); // 加载参数并初始化原有的发布者
+        sf_test_->genSamplesOnUnitSphere(); // 预先生成采样方向
+
+        // 2. 初始化我们自己的可视化发布者
+        black_points_pub_ = nh_.advertise<sensor_msgs::PointCloud2>("/test/black_vertices", 1, true);
+        polyhedron_pub_ = nh_.advertise<visualization_msgs::Marker>("/test/polyhedron", 1, true);
+        clear_pub_ = nh_.advertise<visualization_msgs::MarkerArray>("/test/polyhedron", 1, true); // 用于清除
+
+        // 3. 同步等待并加载地图
+        loadMap();
+
+        // 4. 订阅 RViz 的点击点话题
+        clicked_point_sub_ = nh_.subscribe("/clicked_point", 1, &SingleNodeTester::clickedPointCallback, this);
+
+        ROS_INFO("\n\n=============== 单节点测试已就绪 ===============\n");
+        ROS_INFO("请在 RViz 中使用 'Publish Point' 工具在地图上点击一个点。\n");
+    }
+
+private:
+    ros::NodeHandle nh_;
+    ros::Subscriber clicked_point_sub_;
+    ros::Publisher black_points_pub_;
+    ros::Publisher polyhedron_pub_;
+    ros::Publisher clear_pub_; // 用于清除旧Marker的发布者
+
+    std::unique_ptr<SkeletonFinder> sf_test_;
+
+    void loadMap()
+    {
+        std::string map_topic;
+        nh_.param<std::string>("map_topic_for_test", map_topic, "/map/map");
+        ROS_INFO("正在从话题 '%s' 等待地图...", map_topic.c_str());
+
+        sensor_msgs::PointCloud2::ConstPtr map_msg = ros::topic::waitForMessage<sensor_msgs::PointCloud2>(map_topic, nh_);
+
+        if (map_msg == nullptr) {
+            ROS_ERROR("未能接收到地图消息，程序退出。");
+            ros::shutdown();
+            return;
+        }
+        
+        ROS_INFO("地图已接收，正在处理...");
+        
+        // 手动执行 mapCallBack 中的核心逻辑
+        pcl::fromROSMsg(*map_msg, sf_test_->raw_map_pcl);
+        if (sf_test_->raw_map_pcl.points.empty()) {
+            ROS_ERROR("地图点云为空！");
+            ros::shutdown();
+            return;
+        }
+
+        sf_test_->addBbxToMap(sf_test_->raw_map_pcl);
+        sf_test_->kdtreeForRawMap.setInputCloud(sf_test_->raw_map_pcl.makeShared());
+        
+        ROS_INFO("地图处理完毕，K-d树已构建。");
+    }
+
+    void clickedPointCallback(const geometry_msgs::PointStamped::ConstPtr& msg)
+    {
+        ROS_INFO("接收到点击点: (%.2f, %.2f, %.2f)", msg->point.x, msg->point.y, msg->point.z);
+
+        // 1. 清除旧的可视化内容
+        clearVisualizations();
+
+        // 2. 将点击点转换为 Eigen::Vector3d
+        Eigen::Vector3d clicked_pt(msg->point.x, msg->point.y, msg->point.z);
+
+        // 3. 创建一个临时节点用于测试
+        // 注意：Node的定义在 skeleton_finder_3D.h 中，可以直接使用
+        NodePtr test_node = new Node(clicked_pt, NULL);
+
+        // 4. 调用核心函数进行射线投射，生成黑白顶点
+        ROS_INFO("正在进行射线投射...");
+        sf_test_->genBlackAndWhiteVertices(test_node);
+        ROS_INFO("找到 %zu 个黑色碰撞点。", test_node->black_vertices.size());
+
+        // 5. 可视化黑色顶点
+        visualizeBlackVertices(test_node);
+        
+        // 6. 可视化由黑色顶点构成的多面体
+        visualizePolyhedron(test_node);
+
+        // 7. 释放内存
+        delete test_node; 
+    }
+
+    void clearVisualizations()
+    {
+        // 清除多面体 Marker
+        visualization_msgs::MarkerArray clear_msg;
+        visualization_msgs::Marker clear_marker;
+        clear_marker.action = visualization_msgs::Marker::DELETEALL;
+        clear_msg.markers.push_back(clear_marker);
+        polyhedron_pub_.publish(clear_msg);
+
+        // 发布一个空的点云来清除旧的黑色顶点
+        pcl::PointCloud<pcl::PointXYZ> empty_cloud;
+        sensor_msgs::PointCloud2 empty_cloud_msg;
+        pcl::toROSMsg(empty_cloud, empty_cloud_msg);
+        empty_cloud_msg.header.frame_id = "map";
+        empty_cloud_msg.header.stamp = ros::Time::now();
+        black_points_pub_.publish(empty_cloud_msg);
+    }
+
+    void visualizeBlackVertices(const NodePtr& node)
+    {
+        if (node->black_vertices.empty()) return;
+
+        pcl::PointCloud<pcl::PointXYZ> cloud;
+        for (const auto& vertex : node->black_vertices) {
+            cloud.points.push_back(pcl::PointXYZ(
+                vertex->coord(0), vertex->coord(1), vertex->coord(2)
+            ));
+        }
+        
+        sensor_msgs::PointCloud2 cloud_msg;
+        pcl::toROSMsg(cloud, cloud_msg);
+        cloud_msg.header.frame_id = "map";
+        cloud_msg.header.stamp = ros::Time::now();
+        black_points_pub_.publish(cloud_msg);
+    }
+
+    void visualizePolyhedron(const NodePtr& node)
+    {
+        if (node->black_vertices.size() < 4) {
+            ROS_WARN("黑色顶点数量少于4，无法构建三维多面体。");
+            return;
+        }
+
+        // 提取用于构建凸包的“方向”点云
+        std::vector<quickhull::Vector3<double>> directions_for_hull;
+        for (const auto& bv : node->black_vertices) {
+            // 注意：这里我们直接使用单位球面上的方向来构建凸包的拓扑结构
+            // 这与原始代码中 identifyFrontiers 的逻辑一致
+            directions_for_hull.push_back(
+                node->sampling_directions.at(bv->sampling_dire_index)
+            );
+        }
+
+        // 调用 QuickHull 生成凸包网格
+        quickhull::QuickHull<double> qh;
+        auto mesh = qh.getConvexHullAsMesh(
+            &directions_for_hull[0].x, directions_for_hull.size(), true
+        );
+        
+        // 创建 Marker 进行可视化
+        visualization_msgs::Marker line_list;
+        line_list.header.frame_id = "map";
+        line_list.header.stamp = ros::Time::now();
+        line_list.ns = "polyhedron_test";
+        line_list.id = 0;
+        line_list.type = visualization_msgs::Marker::LINE_LIST;
+        line_list.action = visualization_msgs::Marker::ADD;
+        line_list.pose.orientation.w = 1.0;
+        line_list.scale.x = 0.05; // 线宽
+        line_list.color.r = 0.25;
+        line_list.color.g = 0.75;
+        line_list.color.b = 1.0;
+        line_list.color.a = 0.9;
+
+        // 遍历网格的每个面
+        for (const auto& face : mesh.m_faces) {
+            auto half_edge_indices = mesh.getHalfEdgeIndicesOfFace(face);
+            
+            // 遍历面的每条边
+            for (size_t i = 0; i < half_edge_indices.size(); ++i) {
+                size_t start_vertex_index_on_sphere = mesh.m_halfEdges[half_edge_indices[i]].m_endVertex;
+                size_t end_vertex_index_on_sphere = mesh.m_halfEdges[half_edge_indices[(i + 1) % half_edge_indices.size()]].m_endVertex;
+
+                // 找到这两个方向向量对应的实际三维碰撞点
+                Eigen::Vector3d start_pos = node->black_vertices[start_vertex_index_on_sphere]->coord;
+                Eigen::Vector3d end_pos = node->black_vertices[end_vertex_index_on_sphere]->coord;
+
+                geometry_msgs::Point p1, p2;
+                p1.x = start_pos.x(); p1.y = start_pos.y(); p1.z = start_pos.z();
+                p2.x = end_pos.x(); p2.y = end_pos.y(); p2.z = end_pos.z();
+                
+                line_list.points.push_back(p1);
+                line_list.points.push_back(p2);
+            }
+        }
+
+        polyhedron_pub_.publish(line_list);
+        ROS_INFO("多面体已发布。");
+    }
+};
+
+
+// 新的主函数入口
+int main(int argc, char** argv)
+{
+    ros::init(argc, argv, "single_node_test_node");
+    ros::NodeHandle nh("~");
+
+    SingleNodeTester tester(nh);
+
+    ros::spin();
+
+    return 0;
 }
